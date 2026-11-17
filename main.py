@@ -1,8 +1,10 @@
 """GTA VI launch-day Twitch CCU quantile forecast.
 
-The model pools comparable launch curves in log-ratio space, weighting each
-comparable by how closely its hour-1 scale and pre-launch slope match the case.
-It emits five quantiles for each hour from 2 through 24.
+The hybrid model pools comparable launch curves in log-ratio space. Model A
+forms weighted empirical quantiles from the pool. Model B fits a small OLS
+regression per hour over launch scale, pre-launch slope and release year. The
+two are blended in log space, then a single spread floor is applied before
+rounding. It emits five quantiles for each hour from 2 through 24.
 """
 
 import json
@@ -28,6 +30,7 @@ class Comparable:
     mx: float
     us: bool
     x: float
+    year: int
 
 
 def _parse_ts(value: str) -> datetime:
@@ -92,16 +95,36 @@ def prepare_comparables(case: dict) -> list[Comparable]:
                 mx=mx,
                 us=us,
                 x=x,
+                year=day_start.year,
             )
         )
     return prepared
 
 
 def comparable_weight(comp: Comparable, p: float, x: float) -> float:
-    scale_weight = math.exp(-0.7 * abs(math.log(comp.v1 / p)))
-    slope_weight = math.exp(-0.8 * abs(comp.x - x))
-    us_weight = math.exp(0.8) if comp.us else 1.0
+    scale_weight = math.exp(-0.5 * abs(math.log(comp.v1 / p)))
+    slope_weight = math.exp(-0.25 * abs(comp.x - x))
+    us_weight = math.exp(1.0) if comp.us else 1.0
     return scale_weight * slope_weight * us_weight
+
+
+def select_pool(
+    comparables: list[Comparable],
+    exclude_index: int | None = None,
+) -> list[Comparable]:
+    candidates = [
+        comp
+        for comp in comparables
+        if exclude_index is None or comp.index != exclude_index
+    ]
+    primary = [
+        comp
+        for comp in candidates
+        if 0.15 * comp.mx <= comp.v1 < 0.80 * comp.mx
+    ]
+    if len(primary) >= 6:
+        return primary
+    return [comp for comp in candidates if comp.v1 >= 0.15 * comp.mx]
 
 
 def pool_for(
@@ -110,14 +133,10 @@ def pool_for(
     x: float,
     exclude_index: int | None = None,
 ) -> list[tuple[Comparable, float]]:
-    pool: list[tuple[Comparable, float]] = []
-    for comp in comparables:
-        if exclude_index is not None and comp.index == exclude_index:
-            continue
-        if comp.v1 < 0.15 * comp.mx:
-            continue
-        pool.append((comp, comparable_weight(comp, p, x)))
-    return pool
+    return [
+        (comp, comparable_weight(comp, p, x))
+        for comp in select_pool(comparables, exclude_index=exclude_index)
+    ]
 
 
 def weighted_quantile(pairs: list[tuple[float, float]], level: float) -> float:
@@ -132,6 +151,141 @@ def weighted_quantile(pairs: list[tuple[float, float]], level: float) -> float:
         if cumulative >= target:
             return value
     return ordered[-1][0]
+
+
+def _solve_linear(matrix: list[list[float]], rhs: list[float]) -> list[float] | None:
+    size = len(rhs)
+    augmented = [list(matrix[row]) + [rhs[row]] for row in range(size)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-12:
+            return None
+        if pivot != column:
+            augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        divisor = augmented[column][column]
+        for index in range(column, size + 1):
+            augmented[column][index] /= divisor
+        for row in range(size):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            if factor == 0.0:
+                continue
+            for index in range(column, size + 1):
+                augmented[row][index] -= factor * augmented[column][index]
+    return [augmented[row][size] for row in range(size)]
+
+
+def _fit_regression(
+    pool: list[tuple[Comparable, float]],
+    hour: int,
+) -> tuple[list[float], float] | None:
+    count = len(pool)
+    if count < 6:
+        return None
+
+    features: list[list[float]] = []
+    targets: list[float] = []
+    for comp, _ in pool:
+        features.append(
+            [
+                1.0,
+                math.log(comp.v1),
+                comp.x,
+                (comp.year - 2023) / 3.0,
+            ]
+        )
+        targets.append(math.log(max(comp.hours[hour], 1.0) / comp.v1))
+
+    normal = [[0.0] * 4 for _ in range(4)]
+    rhs = [0.0] * 4
+    for row, target in zip(features, targets):
+        for left in range(4):
+            rhs[left] += row[left] * target
+            for right in range(4):
+                normal[left][right] += row[left] * row[right]
+
+    theta = _solve_linear(normal, rhs)
+    if theta is None:
+        return None
+
+    residual_sum = 0.0
+    for row, target in zip(features, targets):
+        prediction = sum(theta[index] * row[index] for index in range(4))
+        residual = target - prediction
+        residual_sum += residual * residual
+    return theta, math.sqrt(residual_sum / (count - 4))
+
+
+def _model_a_quantiles(
+    p: float,
+    pool: list[tuple[Comparable, float]],
+    hour: int,
+) -> list[float]:
+    pairs = [
+        (math.log(max(comp.hours[hour], 1.0) / comp.v1), weight)
+        for comp, weight in pool
+    ]
+    return [
+        p * math.exp(weighted_quantile(pairs, level))
+        for level in LEVELS
+    ]
+
+
+def _model_b_quantiles(
+    p: float,
+    x: float,
+    case_year: int,
+    pool: list[tuple[Comparable, float]],
+    hour: int,
+) -> list[float] | None:
+    fit = _fit_regression(pool, hour)
+    if fit is None:
+        return None
+    theta, residual_sd = fit
+    median = (
+        theta[0]
+        + theta[1] * math.log(p)
+        + theta[2] * x
+        + theta[3] * (case_year - 2023) / 3.0
+    )
+    spread = max(residual_sd, 0.05)
+    return [p * math.exp(median + z * spread) for z in Z]
+
+
+def _blend_weight(p: float) -> float:
+    if 20_000.0 <= p <= 800_000.0:
+        return 1.0
+    if p > 800_000.0:
+        fraction = min(1.0, (math.log(p) - math.log(800_000.0)) / math.log(3.0))
+    else:
+        fraction = min(1.0, (math.log(20_000.0) - math.log(p)) / math.log(3.0))
+    return max(0.20, 1.0 - 0.65 * fraction)
+
+
+def _guard_blended_iqr(
+    blended: list[float],
+    model_a: list[float],
+) -> list[float]:
+    lower = model_a[1]
+    upper = model_a[3]
+    median = blended[2]
+    if median < lower:
+        bound = lower
+    elif median > upper:
+        bound = upper
+    else:
+        return blended
+    shift = math.log(bound / median)
+    return [math.exp(math.log(value) + shift) for value in blended]
+
+
+def _widen_log_spread(quantiles: list[float], factor: float) -> list[float]:
+    center = math.log(quantiles[2])
+    return [
+        math.exp(center + factor * (math.log(value) - center))
+        for value in quantiles
+    ]
 
 
 def _spread_floor(quantiles: list[float]) -> list[float]:
@@ -191,22 +345,33 @@ def forecast_hours(
     x: float,
     comparables: list[Comparable],
     exclude_index: int | None = None,
+    case_year: int = 2023,
 ) -> list[list[float | int]]:
     pool = pool_for(comparables, p, x, exclude_index=exclude_index)
     if not pool:
         return [_finalize_quantiles(baseline_quantiles(p, hour)) for hour in range(2, 25)]
 
+    blend_weight = _blend_weight(p)
     rows: list[list[float | int]] = []
     for hour in range(2, 25):
-        pairs = [
-            (math.log(max(comp.hours[hour], 1.0) / comp.v1), weight)
-            for comp, weight in pool
-        ]
-        raw = [
-            p * math.exp(weighted_quantile(pairs, level))
-            for level in LEVELS
-        ]
-        rows.append(_finalize_quantiles(raw))
+        model_a = _model_a_quantiles(p, pool, hour)
+        if len(pool) < 6:
+            blended = model_a
+        else:
+            model_b = _model_b_quantiles(p, x, case_year, pool, hour)
+            if model_b is None:
+                blended = model_a
+            else:
+                blended = [
+                    math.exp(
+                        (1.0 - blend_weight) * math.log(model_a[index])
+                        + blend_weight * math.log(model_b[index])
+                    )
+                    for index in range(len(LEVELS))
+                ]
+        blended = _guard_blended_iqr(blended, model_a)
+        blended = _widen_log_spread(blended, 1.1)
+        rows.append(_finalize_quantiles(blended))
     return rows
 
 
@@ -215,8 +380,9 @@ def forecast_case(case: dict, name: str) -> dict:
         raise ValueError(f"{name} asks for levels {case.get('levels')}, not {LEVELS}")
     p = _case_p(case)
     x = _case_x(case)
+    case_year = _parse_ts(case["day_start"]).year
     comparables = prepare_comparables(case)
-    rows = forecast_hours(p, x, comparables)
+    rows = forecast_hours(p, x, comparables, case_year=case_year)
     return {
         "hours": [
             {"hour": hour, "q": quantiles}
