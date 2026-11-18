@@ -25,23 +25,23 @@ MIN_SPREAD_RATIO = 1.25
 # RDR2 2018, Ragnarök 2022, Spider-Man 2 2023), shrunk by 20%. This restores
 # the US-midnight unlock step and US prime-time lift smoothed out by the OLS
 # model; leave-one-out validation cuts the practice score from 0.218 to ~0.182.
-# The hour 15-17 ramp is smoothed so prime time rises gradually instead of
-# stepping at hour 17.
+# Fade the unlock lift before the morning calibration, and build up the
+# evening lift through h18 so it does not peak before prime time.
 CALIBRATION_LIFT = {
     5: 0.3325,
     6: 0.3325,
     7: 0.3325,
-    8: 0.3325,
-    9: 0.3325,
+    8: 0.3,
+    9: 0.2675,
     # Comparable-case LOO residuals show a systematic 10-14h lift.
     10: 0.08,
     11: 0.08,
     12: 0.08,
     13: 0.08,
     14: 0.08,
-    15: 0.12,
-    16: 0.22,
-    17: 0.27,
+    15: 0.06,
+    16: 0.14,
+    17: 0.19,
     18: 0.25,
     19: 0.25,
     20: 0.25,
