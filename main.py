@@ -463,6 +463,12 @@ SHAPE_BLEND = 0.6
 RESIDUAL_BLEND = 0.2
 WIDTH_SCALE = 1.05
 
+# Selected on 37 historical leave-one-launch-out forecasts. The same hour
+# schedule is used for every target.
+LEGACY_HOURLY_BLEND = {2: 0.35, 3: 0.60, 4: 0.50}
+RESIDUAL_HOURS = (5, 12, 13)
+MAX_MEDIAN_STEP = 1.9
+
 
 def _regression_fit(features, targets, weights, ridge):
     size = len(features[0])
@@ -559,8 +565,7 @@ def _residual_centers(p, x, comparables):
     return corrections
 
 
-def forecast_hours(p, x, comparables, exclude_index=None, case_year=2023):
-    peers = [c for c in comparables if c.index != exclude_index]
+def _round14_forecast(p, x, peers, case_year):
     legacy = _legacy_forecast_hours(p, x, peers, case_year=case_year)
     pool = select_pool(peers)
     if len(pool) < 6:
@@ -576,16 +581,105 @@ def forecast_hours(p, x, comparables, exclude_index=None, case_year=2023):
         values = [v * math.exp(shift + (WIDTH_SCALE - 1.0) * math.log(v / old[2]))
                   for v in old]
         if shaped:
-            bounded = min(shaped[-1][2] * 1.9, max(shaped[-1][2] / 1.9, values[2]))
+            bounded = min(shaped[-1][2] * MAX_MEDIAN_STEP,
+                          max(shaped[-1][2] / MAX_MEDIAN_STEP, values[2]))
             values = [v * bounded / values[2] for v in values]
         shaped.append(_finalize_quantiles(values))
     rows = []
     for old, correction in zip(shaped, residual):
         values = [v * math.exp(RESIDUAL_BLEND * fade * correction) for v in old]
         if rows:
-            bounded = min(rows[-1][2] * 1.9, max(rows[-1][2] / 1.9, values[2]))
+            bounded = min(rows[-1][2] * MAX_MEDIAN_STEP,
+                          max(rows[-1][2] / MAX_MEDIAN_STEP, values[2]))
             values = [v * bounded / values[2] for v in values]
         rows.append(_finalize_quantiles(values))
+    return rows
+
+
+def _interpolated_quantile(pairs, level):
+    """Interpolate between midpoints of the weighted empirical CDF steps."""
+    ordered = sorted(pairs)
+    target = level * sum(weight for _, weight in ordered)
+    cumulative = 0.0
+    for index, (value, weight) in enumerate(ordered):
+        midpoint = cumulative + weight * 0.5
+        if target <= midpoint:
+            if index == 0:
+                return value
+            part = (target - previous_midpoint) / (midpoint - previous_midpoint)
+            return previous_value + part * (value - previous_value)
+        previous_value, previous_midpoint = value, midpoint
+        cumulative += weight
+    return ordered[-1][0]
+
+
+def _calibrate_priority_hours(p, x, case_year, peers, rows, fade):
+    # Each correction comes from forecasting a peer without that peer or the
+    # target. Kernel powers and caps were selected by nested historical LOO.
+    h5_residuals = []
+    midday_residuals = {hour: [[] for _ in LEVELS] for hour in (12, 13)}
+    for held in peers:
+        training = [comp for comp in peers if comp.index != held.index]
+        prediction = _round14_forecast(held.v1, held.x, training, held.year)
+        scale_dist = abs(math.log(held.v1 / p))
+        year_dist = abs(held.year - case_year) / 3.0
+        early_weight = math.exp(-0.5 * (abs(held.x - x) + year_dist))
+        midday_weight = math.exp(-scale_dist - 0.5 * year_dist)
+        if early_weight > 0.0:
+            h5_residuals.append((math.log(max(held.hours[5], 1.0) / prediction[3][2]),
+                                 early_weight))
+        if midday_weight > 0.0:
+            for hour in (12, 13):
+                truth = max(held.hours[hour], 1.0)
+                for index, predicted in enumerate(prediction[hour - 2]):
+                    midday_residuals[hour][index].append((math.log(truth / predicted), midday_weight))
+
+    for hour in RESIDUAL_HOURS:
+        residuals = [h5_residuals] * len(LEVELS) if hour == 5 else midday_residuals[hour]
+        if not residuals[0]:
+            continue
+        row = rows[hour - 2]
+        cap = 0.50 if hour == 5 else 0.25
+        adjusted = []
+        for value, level, pairs in zip(row, LEVELS, residuals):
+            delta = _interpolated_quantile(pairs, 0.5 if hour == 5 else level)
+            log_value = math.log(value)
+            adjusted.append(math.exp(log_value + fade * max(-cap, min(cap, delta))))
+        rows[hour - 2] = _finalize_quantiles(sorted(adjusted))
+
+
+def _guard_corrected_hours(rows):
+    # Bound each corrected block from both sides, keeping the untouched hours
+    # fixed. Moving a median shifts its whole row by the same log amount.
+    for block in ((2, 3, 4, 5), (12, 13)):
+        for hours, direction in ((block, -1), (reversed(block), 1)):
+            for hour in hours:
+                neighbor = hour + direction
+                if 2 <= neighbor <= 24:
+                    row = rows[hour - 2]
+                    anchor = rows[neighbor - 2][2]
+                    bound = min(anchor * MAX_MEDIAN_STEP, max(anchor / MAX_MEDIAN_STEP, row[2]))
+                    if bound != row[2]:
+                        rows[hour - 2] = _finalize_quantiles([q * bound / row[2] for q in row])
+
+
+def forecast_hours(p, x, comparables, exclude_index=None, case_year=2023):
+    peers = [comp for comp in comparables if comp.index != exclude_index]
+    rows = _round14_forecast(p, x, peers, case_year)
+    pool = select_pool(peers)
+    if len(pool) < 6:
+        return rows
+    legacy = _legacy_forecast_hours(p, x, peers, case_year=case_year)
+    for hour, weight in LEGACY_HOURLY_BLEND.items():
+        index = hour - 2
+        rows[index] = _finalize_quantiles([
+            math.exp(weight * math.log(a) + (1.0 - weight) * math.log(b))
+            for a, b in zip(legacy[index], rows[index])
+        ])
+    fade = max(0.0, 1.0 - math.log(max(1.0, p / max(comp.v1 for comp in pool))) / math.log(3.0))
+    if fade and len(peers) >= 8:
+        _calibrate_priority_hours(p, x, case_year, peers, rows, fade)
+    _guard_corrected_hours(rows)
     return rows
 
 
