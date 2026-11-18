@@ -68,8 +68,9 @@ def evening_lift(hour: int, x: float) -> float:
 # OLS blend narrows the pool's spread exactly there. On the 26 comparable
 # leave-one-out curves the h3-h5 residual sd is 0.27-0.35 against a final
 # q95/q05 of 1.9-2.5, and 7 of the 10 practice coverage misses sit in h2-h5.
-# Widening just those hours restores the pool's own dispersion.
-EARLY_SPREAD_BOOST = {3: 1.12, 4: 1.12, 5: 1.12}
+# Widen h3-h4 more than h5, where the comparable medians are already
+# less dispersed and the model bands are wider.
+EARLY_SPREAD_BOOST = {3: 1.20, 4: 1.20, 5: 1.12}
 
 
 def early_spread(hour: int) -> float:
