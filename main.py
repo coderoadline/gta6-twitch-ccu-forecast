@@ -410,7 +410,7 @@ def baseline_quantiles(p: float, hour: int) -> list[float]:
     return [p * math.exp(z * SIGMA * math.sqrt(hour - 1)) for z in Z]
 
 
-def forecast_hours(
+def _legacy_forecast_hours(
     p: float,
     x: float,
     comparables: list[Comparable],
@@ -453,6 +453,139 @@ def forecast_hours(
         lift = math.exp(evening_lift(hour, x))
         blended = [value * lift for value in blended]
         rows.append(_finalize_quantiles(blended))
+    return rows
+
+
+# Round 12: joint daily-curve factors plus strictly nested OOF residuals.
+SHAPE_RANK = 6
+SHAPE_RIDGE = 0.3
+SHAPE_BLEND = 0.6
+RESIDUAL_BLEND = 0.2
+WIDTH_SCALE = 1.05
+
+
+def _regression_fit(features, targets, weights, ridge):
+    size = len(features[0])
+    normal = [[sum(w * row[j] * row[k] for row, w in zip(features, weights))
+               + (ridge if j == k and j > 0 else 0.0)
+               for k in range(size)] for j in range(size)]
+    rhs = [sum(w * row[j] * y for row, w, y in zip(features, weights, targets))
+           for j in range(size)]
+    return _solve_linear(normal, rhs)
+
+
+def _dot(left, right):
+    return sum(a * b for a, b in zip(left, right))
+
+
+def _shape_centers(p, x, comparables, case_year):
+    pool = select_pool(comparables)
+    count = len(pool)
+    if count < 6:
+        return None
+    curves = [[math.log(max(c.hours[h], 1.0) / c.v1) for h in range(2, 25)]
+              for c in pool]
+    mean = [sum(row[h] for row in curves) / count for h in range(23)]
+    centered = [[v - a for v, a in zip(row, mean)] for row in curves]
+    covariance = [[sum(row[i] * row[j] for row in centered) / count
+                   for j in range(23)] for i in range(23)]
+    vectors = []
+    for component in range(SHAPE_RANK):
+        vector = [math.sin((i + 1) * (component + 1) * 1.37) for i in range(23)]
+        norm = 0.0
+        for _ in range(70):
+            values = [_dot(row, vector) for row in covariance]
+            for previous in vectors:
+                projection = _dot(values, previous)
+                values = [v - projection * old for v, old in zip(values, previous)]
+            norm = math.sqrt(_dot(values, values))
+            if norm < 1e-12:
+                break
+            updated = [v / norm for v in values]
+            alignment = abs(_dot(updated, vector)) / max(math.sqrt(_dot(vector, vector)), 1e-12)
+            vector = updated
+            if alignment > 1.0 - 1e-10:
+                break
+        if norm < 1e-12:
+            break
+        vectors.append(vector)
+
+    def features(v1, momentum, year):
+        return [math.log(v1 / 100000.0), momentum, (year - 2023) / 3.0,
+                max(momentum, -0.5) ** 2]
+
+    raw = [features(c.v1, c.x, c.year) for c in pool]
+    means = [sum(row[j] for row in raw) / count for j in range(4)]
+    sds = [max(0.15, math.sqrt(sum((row[j] - means[j]) ** 2 for row in raw) / count))
+           for j in range(4)]
+    design = [[1.0] + [(v - a) / sd for v, a, sd in zip(row, means, sds)]
+              for row in raw]
+    scale = min(p, 1.5 * max(c.v1 for c in pool))
+    target = [1.0] + [(v - a) / sd for v, a, sd in
+                      zip(features(scale, x, case_year), means, sds)]
+    scores = []
+    for vector in vectors:
+        theta = _regression_fit(design, [_dot(row, vector) for row in centered],
+                                [1.0] * count, SHAPE_RIDGE)
+        if theta is None:
+            return None
+        scores.append(_dot(theta, target))
+    return [mean[i] + sum(score * vector[i] for score, vector in zip(scores, vectors))
+            + evening_lift(i + 2, x) for i in range(23)]
+
+
+def _residual_centers(p, x, comparables):
+    records = []
+    for held in comparables:
+        if held.v1 < 0.15 * held.mx:
+            continue
+        peers = [c for c in comparables if c.index != held.index]
+        predicted = _legacy_forecast_hours(held.v1, held.x, peers, case_year=held.year)
+        residual = [math.log(max(held.hours[h], 1.0) / predicted[h - 2][2])
+                    for h in range(2, 25)]
+        records.append((held, residual))
+    if len(records) < 6:
+        return [0.0] * 23
+    scale = min(p, 1.5 * max(c.v1 for c in comparables))
+    features = [[1.0, c.x] for c, _ in records]
+    weights = [(20.0 if c.us else 1.0)
+               * math.exp(-0.25 * abs(math.log(c.v1 / scale))) for c, _ in records]
+    total = sum(weights)
+    weights = [w * len(records) / total for w in weights]
+    corrections = []
+    for offset in range(23):
+        theta = _regression_fit(features, [r[offset] for _, r in records], weights, 20.0)
+        corrections.append(theta[0] + theta[1] * x if theta else 0.0)
+    return corrections
+
+
+def forecast_hours(p, x, comparables, exclude_index=None, case_year=2023):
+    peers = [c for c in comparables if c.index != exclude_index]
+    legacy = _legacy_forecast_hours(p, x, peers, case_year=case_year)
+    pool = select_pool(peers)
+    if len(pool) < 6:
+        return legacy
+    centers = _shape_centers(p, x, peers, case_year)
+    if centers is None:
+        return legacy
+    residual = _residual_centers(p, x, peers)
+    fade = max(0.0, 1.0 - math.log(max(1.0, p / max(c.v1 for c in pool))) / math.log(3.0))
+    shaped = []
+    for index, old in enumerate(legacy):
+        shift = fade * SHAPE_BLEND * (centers[index] - math.log(old[2] / p))
+        values = [v * math.exp(shift + (WIDTH_SCALE - 1.0) * math.log(v / old[2]))
+                  for v in old]
+        if shaped:
+            bounded = min(shaped[-1][2] * 1.9, max(shaped[-1][2] / 1.9, values[2]))
+            values = [v * bounded / values[2] for v in values]
+        shaped.append(_finalize_quantiles(values))
+    rows = []
+    for old, correction in zip(shaped, residual):
+        values = [v * math.exp(RESIDUAL_BLEND * fade * correction) for v in old]
+        if rows:
+            bounded = min(rows[-1][2] * 1.9, max(rows[-1][2] / 1.9, values[2]))
+            values = [v * bounded / values[2] for v in values]
+        rows.append(_finalize_quantiles(values))
     return rows
 
 
