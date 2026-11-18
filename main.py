@@ -46,6 +46,17 @@ CALIBRATION_LIFT = {
 }
 
 
+# Leave-one-out residuals in the evening rise monotonically with pre-release
+# momentum: high-momentum launches (x ~= 0.5) ramp harder into prime time, so a
+# fixed lift underestimates that shape. The 0.6 slope comes from regressing the
+# 26 comparable LOO evening residuals on x (about 0.3 per log unit), scaled up
+# slightly to account for extrapolation.
+def evening_lift(hour: int, x: float) -> float:
+    if hour >= 15:
+        return min(0.9, max(0.0, CALIBRATION_LIFT.get(hour, 0.0) + 0.6 * (x - 0.15)))
+    return CALIBRATION_LIFT.get(hour, 0.0)
+
+
 @dataclass(frozen=True)
 class Comparable:
     index: int
@@ -407,7 +418,7 @@ def forecast_hours(
                 ]
         blended = _guard_blended_iqr(blended, model_a)
         blended = _widen_log_spread(blended, widen_factor)
-        lift = math.exp(CALIBRATION_LIFT.get(hour, 0.0))
+        lift = math.exp(evening_lift(hour, x))
         blended = [value * lift for value in blended]
         rows.append(_finalize_quantiles(blended))
     return rows
