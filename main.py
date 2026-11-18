@@ -25,13 +25,17 @@ MIN_SPREAD_RATIO = 1.25
 # RDR2 2018, Ragnarök 2022, Spider-Man 2 2023), shrunk by 20%. This restores
 # the US-midnight unlock step and US prime-time lift smoothed out by the OLS
 # model; leave-one-out validation cuts the practice score from 0.218 to ~0.182.
+# The hour 15-17 ramp is smoothed so prime time rises gradually instead of
+# stepping at hour 17.
 CALIBRATION_LIFT = {
     5: 0.3325,
     6: 0.3325,
     7: 0.3325,
     8: 0.3325,
     9: 0.3325,
-    17: 0.3125,
+    15: 0.12,
+    16: 0.22,
+    17: 0.27,
     18: 0.3125,
     19: 0.3125,
     20: 0.3125,
@@ -259,14 +263,16 @@ def _model_b_quantiles(
     case_year: int,
     pool: list[tuple[Comparable, float]],
     hour: int,
+    p_clip: float | None = None,
 ) -> list[float] | None:
     fit = _fit_regression(pool, hour)
     if fit is None:
         return None
     theta, residual_sd = fit
+    scale_p = p_clip if p_clip is not None else p
     median = (
         theta[0]
-        + theta[1] * math.log(p)
+        + theta[1] * math.log(scale_p)
         + theta[2] * x
         + theta[3] * (case_year - 2023) / 3.0
     )
@@ -373,13 +379,22 @@ def forecast_hours(
         return [_finalize_quantiles(baseline_quantiles(p, hour)) for hour in range(2, 25)]
 
     blend_weight = _blend_weight(p)
+    pool_max = max(comp.v1 for comp, _ in pool)
+    if p > pool_max:
+        extra = min(1.30, 1.0 + 0.10 * math.log2(p / pool_max))
+        p_clip = min(p, 1.5 * pool_max)
+    else:
+        extra = 1.0
+        p_clip = None
+    widen_factor = 1.05 * extra
+
     rows: list[list[float | int]] = []
     for hour in range(2, 25):
         model_a = _model_a_quantiles(p, pool, hour)
         if len(pool) < 6:
             blended = model_a
         else:
-            model_b = _model_b_quantiles(p, x, case_year, pool, hour)
+            model_b = _model_b_quantiles(p, x, case_year, pool, hour, p_clip)
             if model_b is None:
                 blended = model_a
             else:
@@ -391,7 +406,7 @@ def forecast_hours(
                     for index in range(len(LEVELS))
                 ]
         blended = _guard_blended_iqr(blended, model_a)
-        blended = _widen_log_spread(blended, 1.1)
+        blended = _widen_log_spread(blended, widen_factor)
         lift = math.exp(CALIBRATION_LIFT.get(hour, 0.0))
         blended = [value * lift for value in blended]
         rows.append(_finalize_quantiles(blended))
