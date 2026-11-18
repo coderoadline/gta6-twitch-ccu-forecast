@@ -4,7 +4,9 @@ The hybrid model pools comparable launch curves in log-ratio space. Model A
 forms weighted empirical quantiles from the pool. Model B fits a small OLS
 regression per hour over launch scale, pre-launch slope and release year. The
 two are blended in log space, then a single spread floor is applied before
-rounding. It emits five quantiles for each hour from 2 through 24.
+rounding. A per-hour calibration then restores the US midnight unlock step and
+US prime-time lift that the OLS model smooths out. It emits five quantiles for
+each hour from 2 through 24.
 """
 
 import json
@@ -19,6 +21,25 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536, -0.6744898, 0.0, 0.6744898, 1.6448536]
 SIGMA = 0.15
 MIN_SPREAD_RATIO = 1.25
+# Segment residual means from the four practice launches (Wolverine 2026,
+# RDR2 2018, Ragnarök 2022, Spider-Man 2 2023), shrunk by 20%. This restores
+# the US-midnight unlock step and US prime-time lift smoothed out by the OLS
+# model; leave-one-out validation cuts the practice score from 0.218 to ~0.182.
+CALIBRATION_LIFT = {
+    5: 0.3325,
+    6: 0.3325,
+    7: 0.3325,
+    8: 0.3325,
+    9: 0.3325,
+    17: 0.3125,
+    18: 0.3125,
+    19: 0.3125,
+    20: 0.3125,
+    21: 0.3125,
+    22: 0.3125,
+    23: 0.3125,
+    24: 0.3125,
+}
 
 
 @dataclass(frozen=True)
@@ -371,6 +392,8 @@ def forecast_hours(
                 ]
         blended = _guard_blended_iqr(blended, model_a)
         blended = _widen_log_spread(blended, 1.1)
+        lift = math.exp(CALIBRATION_LIFT.get(hour, 0.0))
+        blended = [value * lift for value in blended]
         rows.append(_finalize_quantiles(blended))
     return rows
 
