@@ -397,7 +397,7 @@ def forecast_hours(
     else:
         extra = 1.0
         p_clip = None
-    widen_factor = 1.05 * extra
+    widen_factor = 0.84 * extra
 
     rows: list[list[float | int]] = []
     for hour in range(2, 25):
