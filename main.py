@@ -33,6 +33,12 @@ CALIBRATION_LIFT = {
     7: 0.3325,
     8: 0.3325,
     9: 0.3325,
+    # Comparable-case LOO residuals show a systematic 10-14h lift.
+    10: 0.08,
+    11: 0.08,
+    12: 0.08,
+    13: 0.08,
+    14: 0.08,
     15: 0.12,
     16: 0.22,
     17: 0.27,
