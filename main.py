@@ -156,8 +156,17 @@ def prepare_comparables(case: dict) -> list[Comparable]:
     return prepared
 
 
+# The scale kernel is deliberately sharper than the momentum one: a comparable
+# half the target's size still says a lot about the shape of its launch day, but
+# the closest sizes should dominate. At 0.65 per log unit the weights concentrate
+# a little (effective pool 16.7 -> 15.5 cases at the smallest practice scale,
+# no case above a 0.14 share). On the 26 comparable leave-one-out curves this
+# cuts US LOO loss from 0.156377 to 0.154694 and the all-26 loss from 0.248910
+# to 0.248576. It also narrows Model A's interquartile band at the practice
+# scales, where the blend is pure Model B, so the IQR guard fires on 23 of 92
+# hour-cells instead of 19 and pulls Model B's median back toward the pool.
 def comparable_weight(comp: Comparable, p: float, x: float) -> float:
-    scale_weight = math.exp(-0.5 * abs(math.log(comp.v1 / p)))
+    scale_weight = math.exp(-0.65 * abs(math.log(comp.v1 / p)))
     slope_weight = math.exp(-0.25 * abs(comp.x - x))
     us_weight = math.exp(1.0) if comp.us else 1.0
     return scale_weight * slope_weight * us_weight
