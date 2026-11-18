@@ -335,7 +335,10 @@ def _guard_blended_iqr(
     model_a: list[float],
 ) -> list[float]:
     lower = model_a[1]
-    upper = model_a[3]
+    pool_median = model_a[2]
+    # The empirical upper quartile can cap launch surges too early. Allow
+    # 30% more room above the pool median in log space and keep the lower bound.
+    upper = pool_median * (model_a[3] / pool_median) ** 1.30
     median = blended[2]
     if median < lower:
         bound = lower
