@@ -42,24 +42,24 @@ CALIBRATION_LIFT = {
     15: 0.12,
     16: 0.22,
     17: 0.27,
-    18: 0.3125,
-    19: 0.3125,
-    20: 0.3125,
-    21: 0.3125,
-    22: 0.3125,
-    23: 0.3125,
-    24: 0.3125,
+    18: 0.25,
+    19: 0.25,
+    20: 0.25,
+    21: 0.25,
+    22: 0.25,
+    23: 0.25,
+    24: 0.25,
 }
 
 
 # Leave-one-out residuals in the evening rise monotonically with pre-release
 # momentum: high-momentum launches (x ~= 0.5) ramp harder into prime time, so a
-# fixed lift underestimates that shape. The 0.6 slope comes from regressing the
+# fixed lift underestimates that shape. The 0.8 slope comes from regressing the
 # 26 comparable LOO evening residuals on x (about 0.3 per log unit), scaled up
 # slightly to account for extrapolation.
 def evening_lift(hour: int, x: float) -> float:
     if hour >= 15:
-        return min(0.9, max(0.0, CALIBRATION_LIFT.get(hour, 0.0) + 0.6 * (x - 0.15)))
+        return min(0.9, max(0.0, CALIBRATION_LIFT.get(hour, 0.0) + 0.8 * (x - 0.15)))
     return CALIBRATION_LIFT.get(hour, 0.0)
 
 
