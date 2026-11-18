@@ -63,6 +63,19 @@ def evening_lift(hour: int, x: float) -> float:
     return CALIBRATION_LIFT.get(hour, 0.0)
 
 
+# The hours right after the US-midnight unlock are the least predictable stretch
+# of the day: launches either hold the unlock spike or fall back fast, and the
+# OLS blend narrows the pool's spread exactly there. On the 26 comparable
+# leave-one-out curves the h3-h5 residual sd is 0.27-0.35 against a final
+# q95/q05 of 1.9-2.5, and 7 of the 10 practice coverage misses sit in h2-h5.
+# Widening just those hours restores the pool's own dispersion.
+EARLY_SPREAD_BOOST = {3: 1.12, 4: 1.12, 5: 1.12}
+
+
+def early_spread(hour: int) -> float:
+    return EARLY_SPREAD_BOOST.get(hour, 1.0)
+
+
 @dataclass(frozen=True)
 class Comparable:
     index: int
@@ -423,7 +436,7 @@ def forecast_hours(
                     for index in range(len(LEVELS))
                 ]
         blended = _guard_blended_iqr(blended, model_a)
-        blended = _widen_log_spread(blended, widen_factor)
+        blended = _widen_log_spread(blended, widen_factor * early_spread(hour))
         lift = math.exp(evening_lift(hour, x))
         blended = [value * lift for value in blended]
         rows.append(_finalize_quantiles(blended))
